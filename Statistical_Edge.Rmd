@@ -1,0 +1,1069 @@
+---
+title: "Using R to find a statistical edge in trading"
+author: "Ngan Tran"
+date: "12/19/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message=FALSE,warning = FALSE)
+```
+
+## Introduction
+
+Daytrading the futures market is very difficult as the market is extremely efficient. In order to make money, we need to find a statistical edge to make trading decisions. In this article, we will explore one way to find a statistical edge for trading the futures market using R. We will then devise a trading plan to see if our statistical edge works.
+
+Correlation is a very important concept in trading. We know that some instruments are highly correlated, meaning that their price movements follow each other, either positively or negatively. In this article, we will take a look at the treasury market, specifically the ZN(10 year treasury note), TN(ultra 10 year note), and ZB(30 Year Bond). These instruments are highly correlated so we will try to see if we can use that correlation to our advantage.
+
+If we know that two instruments are highly correlated, then when one instrument, the leader, makes a move, the other should follow. In theory, this should give us a statistical edge since we know the direction of the follower instrument ahead of time. We will investigate this leader-follower dynamic of highly correlated pairs.
+
+## Futures Data
+
+Getting access to historical futures data can be expensive. We will use data from Sierrachart for our analysis since it is affordable and offers an excellent export to CSV function.
+
+## Loading the futures data
+
+Our historical data sets will be stored in <code>txt</code> directory. The data has been exported using Sierrachart's export to text functionality. We loaded contracts dated from 2012-2018.
+
+First let's load our first data set (ZNZ17-that's the December 2017 ZN contract).
+```{r}
+# load our libraries....
+# data.table offers excellent functions for data manipulation of data frames and time series
+library(data.table)
+
+#used for kable function
+library(knitr)
+library(kableExtra)
+
+ZNZ17.dt<-fread('txt/ZNZ17.txt',showProgress=FALSE) # read in our file
+
+#let's take a peek inside
+str(ZNZ17.dt)
+```
+We see that the <code>Date</code> and <code>Time</code> column are expressed as character strings. We need to merge them and convert it to Datetime objects. Also, we don't need the <code>Open</code> price column since we are using tick data. The Open price is the price at the start of a time period. We only need the <code>Last</code> price. The <code>High</code> and <code>Low</code> columns refer to the ask and bid prices respectively. The <code>BidVolume</code> and <code>AskVolume</code> indicate whether the trade happened at the Bid or Ask price and its corresponding volume.
+
+First, let's merge the <code>Date</code> and <code>Time</code> columns together
+```{r}
+ZNZ17.dt[,DateTime := paste(Date,Time, sep =' ')]
+print(head(ZNZ17.dt$DateTime))
+```
+
+Ok, great, now we need to convert the timezones. Sierrachart uses UTC for the tick data. We want to convert it into Pacific time since I live on the Pacific coast.
+
+```{r}
+library(lubridate) #has lots of date time manipulation functions
+
+#let's convert DateTime into a Datetime object instead of a string
+#DateTime is in YYYY/MM/DD HH:MM:SS format
+ZNZ17.dt[,DateTime:=ymd_hms(DateTime)] 
+
+#let's convert time zone from UTC to pacific
+ZNZ17.dt[,DateTime:=with_tz(DateTime,tzone='America/Los_Angeles')]
+ZNZ17.dt[,Date:=date(DateTime)]
+print(head(ZNZ17.dt$DateTime))
+```
+
+Next, we are only interested in dates on the weekdays. We don't want any dates on the weekends. Let's see if there's any weekends.
+```{r}
+print(any(wday(ZNZ17.dt$DateTime) %in% c(1,7)))
+```
+It looks like there are some dates on Saturdays and Sundays. Let's trim our tick data so it only includes days Monday through Friday.
+```{r}
+ZNZ17.dt<-ZNZ17.dt[wday(DateTime) %in% c(2,3,4,5,6)]
+
+#test to see if any weekends in there.
+print(any(wday(ZNZ17.dt$DateTime) %in% c(1,7))) 
+```
+
+Finally, let's delete the columns we don't need.
+```{r}
+ZNZ17.dt[,c('Time','Open','NumberOfTrades'):=NULL]
+print(str(ZNZ17.dt))
+```
+
+Ok, the prices column can be difficult to read on print statements since the changes in prices are in small decimals so we will multiply by a multipier to make it easier to read.
+```{r}
+multiplier = 10000
+
+#define value of 1 tick. TN=ZN ticksize
+ZN.ticksize<- 156.25
+ZB.ticksize<- 312.5
+
+to.ticks <-function(diff,ticksize){
+  diff/ticksize
+}
+
+ZNZ17.dt[,':='(High=High*multiplier,
+            Low=Low*multiplier,
+            Last=Last*multiplier)]
+str(ZNZ17.dt)
+```
+
+Now, that's better and much easier to read.
+
+Next, we're going to label the times so we know when the relevant trading sessions are. We'll define the European night session as being from 12am-5:20am Pacific Time. The regular trading session is from 5:20am-12pm. We'll only interested in trading the regular trading session because that's when liquidity is highest. Trading the night session can be dangerous due to low liquidity issues. Anything after 12pm, we'll define as the afternoon session. We'll ignore the afternoon session because very little volume usually trades then.
+```{r}
+# convert Datetime to number of seconds since midnight to make calculations easier. We need
+# this to tell when the trading sessions starts and ends
+ZNZ17.dt[,secs:=local_time(DateTime)] #converts to seconds
+ZNZ17.dt[secs < 5*3600+20*60, Session:='OVN'] #define the Night session
+ZNZ17.dt[secs >= 5*3600 + 20*60 & secs < 12*3600, Session:='RTH'] #define the Regular trading session
+ZNZ17.dt[secs >= 12*3600, Session:='AFT'] #call this the afternoon session
+ZNZ17.dt<-ZNZ17.dt[Session %in% c('OVN','RTH')]
+```
+
+
+Finally, let's combine all of our code into a function so we can reuse it later.
+```{r}
+loadtxtfile <- function(filename,multiplier=10000){
+  #load the csv file
+  mydt<-fread(filename,showProgress = FALSE)
+ 
+  #with_tz assumes by default time is in UTC timezone. we convert it to Los Angeles time.
+  mydt[,DateTime:=with_tz(ymd_hms(paste(Date,Time,sep = ' ')),tzone='America/Los_Angeles')]
+  
+  #delete columns that we don't need
+  mydt[,c('Date','Time','Open','NumberOfTrades'):=NULL]
+  
+  #get the date
+  mydt[,Date:=date(DateTime)]
+  
+  #eliminate data on the weekends
+  mydt<-mydt[wday(DateTime) %in% c(2,3,4,5,6)]
+  
+  #get the number seconds that passed by since midnight. This is needed to easily know what time of day it is.
+  mydt[,secs:=local_time(DateTime)]
+  
+  #we use a multiplier to make the numbers easier to read
+  mydt[,Last:=Last*multiplier]
+  mydt[,High:=High*multiplier]
+  mydt[,Low:=Low*multiplier]
+  
+  #define the trading sessions for European(OVN), New York(RTH), and afternoon(AFT)
+  mydt[secs < 5*3600+20*60, Session:='OVN']
+  mydt[secs >= 5*3600+20*60 & secs < 12*3600, Session:='RTH']
+  mydt[secs >= 12*3600, Session:='AFT']
+  
+  #eliminate data from the 'AFT' session. We are not interested what happens after the bell closes in NY.
+  return(mydt[Session %in% c('OVN','RTH')])  
+}
+```
+
+
+## Futures rollover
+
+One of the tricky things about futures contracts is that contracts with different expiry dates trade concurrently, so the Dec-17 ZN contract will trade at the same time as the Sep-17 contract. Most traders will only trade with the most active contract. The rollover day happens when the next contract overtakes the older contract in traded volume. We need to find out when that day is.
+
+We will need to load 2 additional contracts to find out the beginning and end date of a contract. One contract with expiry before our contract of interest to determine the beginning date and one with expiry after to the determine the end date. We load the three contracts into memory and compare which contract has the most volume on a particular day. 
+```{r }
+#we load the ZNU17 contract to find out the beginning date fof ZNZ17
+ZNU17.dt<-loadtxtfile('txt/ZNU17.txt')
+
+#we load the ZNH18 (Mar-18) contract to find out the end date of ZNZ17.
+ZNH18.dt<-loadtxtfile('txt/ZNH18.txt')
+
+# we total the volume traded each day during the RTH session(regular trading hours).
+rth_vol_ZNZ17 <- ZNZ17.dt[Session=='RTH'][,list(TotalVolume=sum(Volume)),by=Date]
+rth_vol_ZNU17 <- ZNU17.dt[Session=='RTH'][,list(TotalVolume=sum(Volume)),by=Date]
+rth_vol_ZNH18 <- ZNH18.dt[Session=='RTH'][,list(TotalVolume=sum(Volume)),by=Date]
+
+#lets merge the three data tables together so we can find when the volume rollovers are
+
+combined1 <- merge(rth_vol_ZNZ17,rth_vol_ZNU17,by=c('Date'),suffixes = c('.ZNZ17','.ZNU17'))
+combined2 <- merge(rth_vol_ZNZ17,rth_vol_ZNH18,by=c('Date'),suffixes = c('.ZNZ17','.ZNH18'))
+
+#get the first date that ZNZ17 has greater volume than ZNU17. This is the beginning of the ZNZ17 contract.
+firstdate <- combined1[,Date[TotalVolume.ZNZ17 > TotalVolume.ZNU17]][1]
+
+#get the first date that ZNH18 has greater volume than ZNZ17 and then subtract 1 to get the last date of the ZNZ17 contract.
+lastdate <- combined2[,Date[TotalVolume.ZNH18 > TotalVolume.ZNZ17]][1]-1
+
+#print the first and last date
+print(firstdate)
+print(lastdate)
+```
+
+Perfect! We now what the date range for the ZNZ17 contract is. We'll trim the data table to include only those dates.
+```{r}
+ZNZ17.dt<-ZNZ17.dt[Date >= firstdate][Date <= lastdate]
+print(unique(ZNZ17.dt$Date))
+
+```
+There are <code>64</code> days in the ZNZ17 contract.
+
+Let's put this all together in a function so we can reuse the code.
+```{r}
+# returns all the valid dates in vector form for a contract
+# contract_filename is the file name of the contract we want to find the dates for
+# next_contract and prev_contract filename are the file names of the next and previous contract 
+get.contract.dates<-function(contract_filename,prev_contract_filename,next_contract_filename){
+  this.contract.dt <- loadtxtfile(contract_filename)
+  prev.contract.dt <- loadtxtfile(prev_contract_filename)
+  next.contract.dt <- loadtxtfile(next_contract_filename)
+  
+  #get a total of the daily volume during the RTH session
+  rth_this <- this.contract.dt[Session=='RTH'][,list(TotalVolume=sum(Volume)),by=Date]
+  rth_prev <- prev.contract.dt[Session=='RTH'][,list(TotalVolume=sum(Volume)),by=Date]
+  rth_next <- next.contract.dt[Session=='RTH'][,list(TotalVolume=sum(Volume)),by=Date]
+  
+  #merge the data tables to compare the daily volumes
+  combined1 <- merge(rth_this,rth_prev,by=c('Date'),suffixes = c('.this','.prev'))
+  combined2 <- merge(rth_this,rth_next,by=c('Date'),suffixes = c('.this','.next'))
+  
+  #the first date is when the contract overtakes the previous contract
+  firstdate <- combined1[,Date[TotalVolume.this > TotalVolume.prev]][1]
+  #the last date is when the next contract overtakes the previous contract minus 1 day
+  lastdate  <- combined2[,Date[TotalVolume.this < TotalVolume.next]][1]-1
+  
+  #trim the dates
+  this.dates<- rth_this[Date >= firstdate][Date <= lastdate][,Date]
+  return(this.dates)
+}
+```
+
+We'll run the <code>get.contract.dates</code> function on all the contracts that we want. Then we'll save them so we can reuse it later on. However, we have a lot of contracts that we want to get the dates for. It would be tedious to type all those file names in by hand. Let's create a function to automate the process.
+```{r}
+
+# let's make a function that returns the next contract name when we input a contract name
+# the CME contract names follow the pattern H-M-U-Z, where 'H' is Mar, 'M' is Jun, 'U' is Sep and 'Z' is Dec.
+# for example ZNH17 ==> ZNM17, ZNZ17==>ZNH18 
+next.contract <- function(contractname){
+  contract_string<-substr(contractname,1,2)
+  yr <- as.integer(substr(contractname,4,5))
+  
+  #takes a contract letter and returns the next character. H->M, M->U, U->Z, Z->H
+  next.letter <- switch(substr(contractname,3,3),
+                        'H'='M',
+                        'M'='U',
+                        'U'='Z',
+                        'Z'='H')
+  if(next.letter=='H'){
+    yr <- yr + 1
+  }
+  return(paste(contract_string,next.letter,yr,sep=''))
+}
+# this function takes a contract name and returns the name of the previous contract
+# ZNZ17==>ZNU17, ZNH18 ==> ZNZ17
+prev.contract <- function(contractname){
+  contract_string<-substr(contractname,1,2)
+
+  # takes a contract letter and returns the previous character. H->Z, M->H, U->M, Z->U
+  prev.letter <- switch(substr(contractname,3,3),
+                        'H'='Z',
+                        'M'='H',
+                        'U'='M',
+                        'Z'='U')
+  yr<-as.integer(substr(contractname,4,5))
+  if(prev.letter=='Z'){
+    yr <- yr - 1
+  }
+  return(paste(contract_string,prev.letter,yr,sep=''))
+}
+```
+
+Now, let's get all the valid dates for the various contracts that includes rollover dates. We'll save those dates in the 'dates/' folder.
+```{r }
+
+ZN.contracts <- c(                'ZNU16','ZNZ16',
+                  'ZNH17','ZNM17','ZNU17','ZNZ17',
+                  'ZNH18','ZNM18','ZNU18','ZNZ18')
+
+TN.contracts <- c(                'TNU16','TNZ16',
+                  'TNH17','TNM17','TNU17','TNZ17',
+                  'TNH18','TNM18','TNU18','TNZ18')
+
+ZB.contracts <- c(                'ZBU16','ZBZ16',
+                  'ZBH17','ZBM17','ZBU17','ZBZ17',
+                  'ZBH18','ZBM18','ZBU18','ZBZ18')
+
+for (x in ZN.contracts) {
+  this.filename <- paste('txt/',x,'.txt',sep='')
+  next.filename <- paste('txt/',next.contract(x),'.txt',sep='')
+  prev.filename <- paste('txt/',prev.contract(x),'.txt',sep='')
+  
+  dates <- get.contract.dates(this.filename,prev.filename,next.filename)
+  
+  # we'll save our dates files in dates/ directory
+  saveRDS(dates,file=paste('dates/',x,'.rds',sep=''))
+}
+```
+
+For the last contract, ZNH19, we don't have a next contract yet because it's the most current contract as of this writing. To get the contract dates, we take the dates after the last date of the previous contract. All dates after that will be valid for ZNH19.
+```{r}
+ZNH19.dates<-loadtxtfile('txt/ZNH19.txt')[Date > max(readRDS('dates/ZNZ18.rds')),unique(Date)]
+saveRDS(ZNH19.dates,'dates/ZNH19.rds')
+```
+## Holidays
+
+Next, we'll trim the tick data table for holidays. We do not want to trade during the holidays because liquidity and price movement can be erratic. Let's take a look at our ZNZ17.dt data table to find out when the holidays are.
+```{r}
+# Usually during the holidays, trading ends early. We'll search for days that end early.
+# we find the time of the last trade of each day
+lasttick.dt<-ZNZ17.dt[,list(lasttick=max(secs),TotalVolume=sum(Volume)),by=Date]
+print(quantile(lasttick.dt$lasttick))
+print(quantile(lasttick.dt$TotalVolume))
+```
+
+Hmm... Looks like there are some days where the last trade happened much sooner than the closing time of 12pm (43199 seconds is approximately noon). Let's dig further. 
+
+```{r }
+# we define early closing as when the last trade happens before 11:45 am.  
+k<-kable(lasttick.dt[lasttick < 42300],format='html')
+kable_styling(k,bootstrap_options = c("striped"), full_width = FALSE,position='left')
+```
+These dates correspond to Labor Day and Thanksgiving Holiday. No way we trade during these days. The <code>TotalVolume</code> during those days is also very low considering that the average volume per day is roughly 1M contracts. It's best we avoid these days. 
+
+```{r}
+holidays<-lasttick.dt[lasttick < 42300]$Date
+# let's trim the holidays from out data table
+ZNZ17.dt<-ZNZ17.dt[!(Date %in% holidays)]
+print(unique(ZNZ17.dt$Date))
+```
+Great! Looks like we trimmed the holidays from the <code>ZNZ17.dt</code> data table.
+
+Let's make a function that extracts the holidays from a data table and run that on all of our contracts. We'll save the result in a file.
+```{r }
+# returns a vector of dates of holidays. takes as argument a filename corresponding to the contract txt file.
+# we define a holiday as any day where the last trade happens before 11:45 am
+get.holidays<-function(filename){
+  tickdata.dt <- loadtxtfile(filename)
+  mydt<-tickdata.dt[,list(lasttick=max(secs)),by=Date]
+  return(mydt[lasttick < 42300]$Date)
+}
+
+holiday.dates<-NULL
+for(x in c(ZN.contracts,'ZNH19')){
+  filename<-paste('txt/',x,'.txt',sep='')
+  holiday.dates<-c(holiday.dates,get.holidays(filename))
+}
+saveRDS(holiday.dates,file=paste('dates/holidays.rds'))
+```
+
+
+## Processing all the text files
+For the next steps : 
+1. We'll load all of the contracts that we're interested in (ZN,TN,ZB) for 2016-2018
+2. Process the text files and turn them into a data.table,
+3. Trim them using dates we generated from calculating the rollovers
+4. Trim them again using the holiday dates
+5. Save it as an RDS file to enable faster processing
+
+```{r }
+for(x in c(ZN.contracts,TN.contracts,ZB.contracts,'ZNH19','TNH19','ZBH19')){
+  mydt<-loadtxtfile(paste('txt/',x,'.txt',sep=''))
+  month_yr_string <- substr(x,3,5)
+  dates<-readRDS(paste('dates/ZN',month_yr_string,'.rds',sep='')) # use the dates from the ZN contract to trim.
+  mydt<-mydt[Date %in% dates][!(Date %in% holiday.dates)] # trim the holidays
+  saveRDS(mydt,paste('rds/',x,'.rds',sep='')) # save the data.table in rds/ directory
+}
+```
+
+Now that we have individually process each contract, let's combine them together to make it easier to process.
+```{r }
+combine.rds <- function(contracts){
+  mydt<-NULL
+  for(x in contracts){
+    x.dt<-readRDS(paste('rds/',x,'.rds',sep=''))
+    mydt<-rbind(mydt,x.dt,use.names=TRUE)
+  }
+  return(mydt)
+}
+
+#combine ZN, ZB, and TN
+ZN<-combine.rds(c(ZN.contracts,'ZNH19'))
+ZB<-combine.rds(c(ZB.contracts,'ZBH19'))
+TN<-combine.rds(c(TN.contracts,'TNH19'))
+```
+
+## Correlation
+
+Now that we have the tick data ordered and organize, let's take a look at the correlation coefficient between the different instruments.
+```{r }
+#first we need to merge the data tables. Since the TN contract has fewer dates because it's a new instrument, we'll trim the ZN contract to match it.
+
+tn.dates<-unique(TN$Date)
+time_vec <- as.difftime(seq(5*3600+20*60,12*3600,by=10),units='secs')
+
+# do a cross join of dates and times we want
+# this creates the Dates and Times data table that we will use to left join all of your data.
+combined <- CJ(tn.dates,time_vec)
+colnames(combined)<-c('Date','secs')
+
+combined <- TN[,list(Date,secs,TN.Price=Last)][combined, roll='nearest', on=list(Date,secs)]
+combined <- ZN[,list(Date,secs,ZN.Price=Last)][combined, roll='nearest', on=list(Date,secs)]
+combined <- ZB[,list(Date,secs,ZB.Price=Last)][combined, roll='nearest', on=list(Date,secs)]
+
+cor.dt <- combined[,list(cor_ZNTN=cor(ZN.Price,TN.Price),
+                     cor_ZNZB=cor(ZN.Price,ZB.Price),
+                     cor_ZBTN=cor(ZB.Price,TN.Price)),by=Date]
+
+```
+
+
+Let's plot the daily correlation coefficients.
+```{r}
+library(ggplot2)
+print(summary(cor.dt$cor_ZNTN))
+ggplot(cor.dt, aes(cor_ZNTN)) + geom_histogram(binwidth = 0.02) + ggtitle('Correlation of ZN and TN') + xlab('Correlation Coefficient each day') + ylab('Number of days')
+```
+
+For the most part, the ZN and TN are highly correlated. Is the ZB similar too?
+
+```{r}
+print(summary(cor.dt$cor_ZNZB))
+ggplot(cor.dt,aes(cor_ZNZB)) + geom_histogram(binwidth=0.02) + ggtitle('Correlation coefficient of ZN and ZB') + xlab('Correlation Coefficient each day') + ylab('Number of days')
+```
+
+```{r}
+print(summary(cor.dt$cor_ZBTN))
+ggplot(cor.dt,aes(cor_ZBTN)) + geom_histogram(binwidth = 0.02)+ ggtitle('Correlation of ZB and TN') + xlab('Correlation Coefficient each day') + ylab('Number of days')
+```
+
+The ZN-ZB are not as highly correlated as the ZN-TN. The ZB-TN relationship has higher correlation than ZB-ZN but less than ZN-TN. All together, all three are highly correlated together.
+
+## Session Highs and Lows
+
+The highs and lows of each session are of particular interest to traders. Next up, we want to find the session highs and lows for both the RTH(regular trading hours) and OVN(European session). We also want to know which days prices during the RTH session breaks the highs and lows of the European session. Let's write a function that to find that out.
+```{r }
+addHighLow <- function(tick.dt){
+  mydt<-copy(tick.dt)
+  
+  # NHigh/NLow refers to the High/Low of the European session
+  # RHigh/RLow refers to the High/Low of the RTH session
+  mydt<-mydt[,':='(NHigh=max(Last[Session=='OVN']),
+                   NLow=min(Last[Session=='OVN']),
+                   RHigh=max(Last[Session=='RTH']),
+                   RLow=min(Last[Session=='RTH'])),by=Date]
+  
+  # let's find out which days the high/lows of the European session is broken
+  mydt[,':='(BrkNH=RHigh > NHigh,
+             BrkNL=RLow < NLow)]
+  
+  # find out when during the day it happens too
+  mydt[BrkNH==TRUE,BrkNH.Time := secs[which(Last > NHigh)[1]],by=Date]
+  mydt[BrkNL==TRUE,BrkNL.Time := secs[which(Last < NLow )[1]],by=Date]
+  return(mydt)
+}
+
+# process our tick data
+ZN<-addHighLow(ZN)
+ZB<-addHighLow(ZB)
+TN<-addHighLow(TN)
+```
+
+We'll summarize the tick data to get a general overview.
+```{r}
+ZN.daily<-ZN[order(DateTime),.SD[1,list(NHigh,NLow,RHigh,RLow,ROpen=Last[Session=='RTH'][1],BrkNH,BrkNL,BrkNH.Time,BrkNL.Time)],by=Date]
+TN.daily<-TN[order(DateTime),.SD[1,list(NHigh,NLow,RHigh,RLow,ROpen=Last[Session=='RTH'][1],BrkNH,BrkNL,BrkNH.Time,BrkNL.Time)],by=Date]
+ZB.daily<-ZB[order(DateTime),.SD[1,list(NHigh,NLow,RHigh,RLow,ROpen=Last[Session=='RTH'][1],BrkNH,BrkNL,BrkNH.Time,BrkNL.Time)],by=Date]
+```
+
+Let's define a function that takes a boolean vector and returns the percentage of TRUE values.
+```{r}
+# the indices argument is included so the boot function can use it
+prob<-function(data, indices=NULL){
+  if(is.null(indices)) {
+    return(sum(data)/length(data))
+  }
+  return(sum(data[indices])/length(data[indices]))
+}
+```
+
+Now, let's find the probability of the RTH session breaking the European session highs or lows. We'll use a method called bootstrap to find the mean and 95% confidence intervals. We'll load the boot function from the boot package to do our bootstrap.
+
+Let's create a function to calculate the mean and 95% confidence interval using the bootstrap method. We'll use the bootstrap method because it's an excellent choice when we're not sure what the distribution of the data looks like, (ie is the data normally distributed?). 
+```{r }
+# takes a vector(data), statistic function(func), number of repetitions(n) and returns a vector of the mean, 2.5% and 97.5% confidence interval
+boot.mean.ci <- function(data, func, n=10000){
+  mylist <- NULL
+  for(i in 1:n){
+    mysample <- sample(x=data,size=length(data),replace=TRUE)
+    mylist <- c(mylist,func(mysample))
+  }
+  m <- mean(mylist)
+  ci <- quantile(mylist,probs=c(0.025,0.975))
+  values <- c(m,ci[1],ci[2])
+  names(values)<-c('mean','2.5%','97.5%')
+  return(values)
+}
+
+```
+
+
+
+```{r}
+set.seed(123)
+b<-boot.mean.ci(ZN.daily[,BrkNH|BrkNL],prob)
+print(b)
+```
+Looks like there's almost a 96%  probability that the ZN price in the RTH session breaks the European session high or low. The 95% confidence interval is (94.8%, 97.0%) That's important to know. How about the TN or ZB? Do they behave in a similar manner?
+
+```{r}
+b<-boot.mean.ci(data=ZB.daily[,BrkNH|BrkNL],func=prob)
+print(b)
+```
+
+```{r}
+b<-boot.mean.ci(data=TN.daily[,BrkNH|BrkNL],prob)
+print(b)
+```
+
+It seems both the TN and ZB also tends to break either the European session highs or lows, in slightly greater frequency than the ZN. However, the 95% confidence interval overlaps. Let's calculate the p-values to see if this is statistically significant.
+
+Let's create a function that calculates the p-value using permutations and calculate the p-values for our data set.
+```{r}
+# data1 and data2 are a set of vectors that contains our data of interest
+# func is the statistical function that we want to calculate like mean, median, etc
+# n is the number of permutations to calculate
+p.value<-function(data1,data2,func,n=10000){
+  stat1<-func(data1)
+  stat2<-func(data2)
+  observed.stat <- (stat2-stat1)
+  
+  len1<- length(data1)
+  combined <- c(data1,data2)
+  len.total <- length(combined)
+  perm.stats<-NULL
+  for(x in 1:n){
+    scrambled <- sample(combined,size=len.total)
+    grp1 <- scrambled[1:len1]
+    grp2 <- scrambled[(len1+1):len.total]
+    perm.stats<-c(perm.stats,func(grp2)-func(grp1))
+  }
+  return(sum(abs(perm.stats)>=abs(observed.stat))/n)
+}
+
+#run the p.value for the probability of breaking high and lows between the instruments
+p.ZNTN <- p.value(ZN.daily[,BrkNH|BrkNL],TN.daily[,BrkNH|BrkNL],func=prob,n=100000)
+p.ZNZB <- p.value(ZN.daily[,BrkNH|BrkNL],ZB.daily[,BrkNH|BrkNL],func=prob,n=100000)
+p.TNZB <- p.value(TN.daily[,BrkNH|BrkNL],ZB.daily[,BrkNH|BrkNL],func=prob,n=100000)
+
+d<-data.table(comparison=c('ZN-TN','ZN-ZB','TN-ZB'),"p-values"=c(p.ZNTN,p.ZNZB,p.TNZB))
+
+k<-kable(d,format='html')
+kable_styling(k,bootstrap_options='striped',full_width = FALSE,position='left')
+```
+The p-values show that there is no affinity for any of the instruments to break the highs and lows over one another.
+
+Is there a preference for breaking the highs vs the lows?
+```{r}
+print(paste("[ZN] BrkNH: ",ZN.daily[,prob(BrkNH)]," BrkNL: ", ZN.daily[,prob(BrkNL)]))
+print(paste("[ZB] BrkNH: ",ZB.daily[,prob(BrkNH)]," BrkNL: ", ZB.daily[,prob(BrkNL)]))
+print(paste("[TN] BrkNH: ",TN.daily[,prob(BrkNH)]," BrkNL: ", TN.daily[,prob(BrkNL)]))
+```
+The European high side tends to get taken out more. Is it statistically significant? Let's calculate the p-values.
+```{r}
+p.ZN=p.value(ZN.daily[,BrkNH],ZN.daily[,BrkNL],prob)
+p.ZB=p.value(ZB.daily[,BrkNH],ZB.daily[,BrkNL],prob)
+p.TN=p.value(TN.daily[,BrkNH],TN.daily[,BrkNL],prob)
+
+d<-data.table(Symbols=c('ZN','ZB','TN'),'p-values'=c(p.ZN,p.ZB,p.TN))
+k<-kable(d,format='html')
+kable_styling(k,bootstrap_options = 'striped',full_width = F,position='left')
+```
+
+Here, the p-values for the ZB is quite high. It doesn't seem to favor breaking the session highs or lows. However, the ZN and TN does seem to favor the highs even the p-value is greater than 0.05.
+
+What about the RTH session breaking both the European highs and lows on the same day?
+```{r}
+print(paste('[ZN] P(BrkNH and BrkNL):',ZN.daily[,prob(BrkNH & BrkNL)]))
+print(paste('[ZB] P(BrkNH and BrkNL):',ZB.daily[,prob(BrkNH & BrkNL)]))
+print(paste('[TN] P(BrkNH and BrkNL):',TN.daily[,prob(BrkNH & BrkNL)]))
+
+b.ZN <- boot.mean.ci(ZN.daily[,BrkNH & BrkNL],prob)
+b.ZB <- boot.mean.ci(ZB.daily[,BrkNH & BrkNL],prob)
+b.TN <- boot.mean.ci(TN.daily[,BrkNH & BrkNL],prob)
+
+d<-data.table(Symbols=c('ZN','ZB','TN'),mean=c(b.ZN[1],b.ZB[1],b.TN[1]),
+              lower_ci=c(b.ZN[2],b.ZB[2],b.TN[2]),
+              upper_ci=c(b.ZN[3],b.ZB[3],b.TN[3]))
+
+ggplot(d, aes(x=Symbols, y=mean, ymin=lower_ci,ymax=upper_ci))+geom_point()+geom_errorbar(width=0.2)+ggtitle('Mean probability of both BrkNH and BrkNL happening on the same day')
+```
+
+The ZN has a slightly lower tendency to break both the highs and lows of the European session than the TN and ZB. However, all 3 confidence intervals overlap quite a bit so we shouldn't expect a major difference between the 3 of them. We should expect a roughly 30% probability that the RTH session breaks both the European highs and lows. 
+
+## Combining correlation with breaks of the highs and lows
+
+We know that the ZN,ZB, and TN are highly correlated. What happens when one instrument breaks the European session highs or lows, do all the other instruments do the same? Let's find out!
+
+```{r}
+# to do our comparison we need to merge data.tables
+daily.combined <- merge(ZN.daily,ZB.daily,suffixes=c('.ZN','.ZB'),by=c('Date'))
+daily.combined <- merge(daily.combined,TN.daily[,list(Date,NHigh.TN=NHigh,NLow.TN=NLow,
+                                                      RHigh.TN=RHigh,RLow.TN=RLow,ROpen.TN=ROpen,
+                                                      BrkNH.TN=BrkNH,BrkNL.TN=BrkNL,
+                                                      BrkNH.Time.TN=BrkNH.Time,BrkNL.Time.TN=BrkNL.Time)],by=c('Date'))
+```
+
+What if the ZB breaks the European high, what are the odds the ZN does the same?
+```{r}
+daily.combined[BrkNH.ZB==TRUE,prob(BrkNH.ZN)]
+```
+
+89.5%. That's a pretty good correlation. There's a small error in our logic though. We are not taking into account time of day. We are just counting if they break on the same day. For instance, if ZN breaks first before the ZB, our test wouldn't know that. We can't tell the future so we shouldn't include that in the case. We should only include cases where the ZB breaks first since we want to see if ZN follows. Let's redo the test.
+
+```{r}
+daily.combined[BrkNH.ZB==TRUE & (BrkNH.ZN==FALSE | (BrkNH.Time.ZB < BrkNH.Time.ZN)),prob(BrkNH.ZN)]
+```
+
+Much better. Here we only included cases where either the ZN didn't break the high or it broke after the ZB. 82.4% is still very high, though not as good as 89.5%.
+
+Let's check the confidence intervals.
+```{r}
+b <- boot.mean.ci(daily.combined[BrkNH.ZB==TRUE & (BrkNH.ZN==FALSE | (BrkNH.Time.ZB < BrkNH.Time.ZN)),BrkNH.ZN],prob)
+print(b)
+
+```
+
+The average is around 82.4%. At the very least, we should expect a 76.9% probability that the ZN will follow the ZB in breaking the highs. A pretty good correlation.
+
+What if we reverse the order, meaning we want to find out what happens when ZN breaks first, does the ZB follow?
+```{r}
+data<-daily.combined[BrkNH.ZN==TRUE & (BrkNH.ZB==FALSE | (BrkNH.Time.ZN < BrkNH.Time.ZB)),BrkNH.ZB]
+b<- boot.mean.ci(data,prob)
+print(b)
+
+```
+80.7%. At the very least, we should expect a 74.1% chance that ZB follows the ZN. Much lower than if ZB is the leader. Does this mean that ZB is more of a leader for the ZN? Let's check p values to make sure if our relationship is statistically significant.
+
+```{r}
+ZB.breaks.first <- daily.combined[BrkNH.ZB==TRUE & (BrkNH.ZN==FALSE | BrkNH.Time.ZB < BrkNH.Time.ZN), BrkNH.ZN]
+ZN.breaks.first <- daily.combined[BrkNH.ZN==TRUE & (BrkNH.ZB==FALSE | BrkNH.Time.ZN < BrkNH.Time.ZB), BrkNH.ZB]
+p.value(ZB.breaks.first,ZN.breaks.first,func = prob,n=10000)
+```
+
+Again, p-value is very high so we can't say whether the ZN or ZB has an affinity to be a leader or follower.
+Let's calculate the same for TN.
+```{r}
+TN.breaks.first <- daily.combined[BrkNH.TN==TRUE & (BrkNH.ZN==FALSE | BrkNH.Time.TN < BrkNH.Time.ZN), BrkNH.ZN]
+
+ZN.breaks.first <- daily.combined[BrkNH.ZN==TRUE & (BrkNH.TN==FALSE | BrkNH.Time.ZN < BrkNH.Time.TN), BrkNH.TN]
+
+p<-p.value(TN.breaks.first,ZN.breaks.first,func = prob,n=10000)
+
+d<-data.table(Type=c('TN Breaks first','ZN breaks first','p-value'),Probability=c(prob(TN.breaks.first),prob(ZN.breaks.first),p))
+k<-kable(d,format='html',digits=3)
+kable_styling(k,bootstrap_options = 'striped',full_width = F, position='left')
+```
+
+P-value is very high here so we can't really say that there's a leader-follower relationship here. Both ZN/TN show high positive correlations for breaking highs and lows though. We should expect approximately 90% probability, that one instrument will follow the other to break the session highs or lows.
+
+## Trading ranges
+
+Let's investigate more the volatility of these instruments. What are the average number of ticks the instrument moves per day for the RTH session? 
+```{r}
+rth.range.ZN<- ZN.daily[,(RHigh-RLow)/ZN.ticksize]
+rth.range.TN<- TN.daily[,(RHigh-RLow)/ZN.ticksize]
+rth.range.ZB<- ZB.daily[,(RHigh-RLow)/ZB.ticksize]
+
+d<-data.table(Symbol=c('ZN','TN','ZB'),
+              "mean"=c(mean(rth.range.ZN),mean(rth.range.TN),mean(rth.range.ZB)),
+              "median"=c(median(rth.range.ZN),median(rth.range.TN),median(rth.range.ZB)),
+              "std dev"=c(sd(rth.range.ZN),sd(rth.range.TN),sd(rth.range.ZB)))
+k<-kable(d,format='html',digits=1,caption='RTH Session Volatility',padding=0)
+kable_styling(k,bootstrap_options = 'striped', full_width = F, position='left')
+
+```
+In terms of volatility, the ZN is the least volatile. It moves about on average(median) 20 ticks on the RTH session. It has the smallest range of all the three instruments. The TN and ZB are similar in terms of tick volatility. However, each tick of the TN is worth 15.625 USD while the ZB is worth 31.25 USD so the ZB is about twice as volatile in terms of dollars. The TN and ZN are both worth 15.625 USD per tick.
+
+What about the European session, what are the ranges for that?
+
+```{r}
+ovn.range.ZN<- ZN.daily[,(NHigh-NLow)/ZN.ticksize]
+ovn.range.TN<- TN.daily[,(NHigh-NLow)/ZN.ticksize]
+ovn.range.ZB<- ZB.daily[,(NHigh-NLow)/ZB.ticksize]
+
+d<-data.table(Symbol=c('ZN','TN','ZB'),
+              "mean"=c(mean(ovn.range.ZN),mean(ovn.range.TN),mean(ovn.range.ZB)),
+              "median"=c(median(ovn.range.ZN),median(ovn.range.TN),median(ovn.range.ZB)),
+              "std dev"=c(sd(ovn.range.ZN),sd(ovn.range.TN),sd(ovn.range.ZB)))
+k<-kable(d,format='html',digits=1,caption='European Session Volatility')
+kable_styling(k,bootstrap_options = 'striped', full_width = F, position='left')
+```
+
+Here, we can see that the European session has about half the volatility of the RTH session.
+
+When an instrument breaks the European session highs or lows, how much higher or lower does it cross the highs and lows?
+
+```{r}
+cross.high.ZN <- ZN.daily[BrkNH==TRUE,(RHigh-NHigh)/ZN.ticksize]
+cross.high.TN <- TN.daily[BrkNH==TRUE,(RHigh-NHigh)/ZN.ticksize]
+cross.high.ZB <- ZB.daily[BrkNH==TRUE,(RHigh-NHigh)/ZB.ticksize]
+
+d<-data.table(Symbol=c('ZN','TN','ZB'),
+              "mean"=c(mean(cross.high.ZN),mean(cross.high.TN),mean(cross.high.ZB)),
+              "median"=c(median(cross.high.ZN),median(cross.high.TN),median(cross.high.ZB)),
+              "std dev"=c(sd(cross.high.ZN),sd(cross.high.TN),sd(cross.high.ZB)))
+k<-kable(d,format='html',digits=1,caption='RHigh-NHigh difference')
+kable_styling(k, bootstrap_options = 'striped', full_width=F, position='left')
+
+cross.low.ZN <- ZN.daily[BrkNL==TRUE,(NLow-RLow)/ZN.ticksize]
+cross.low.TN <- TN.daily[BrkNL==TRUE,(NLow-RLow)/ZN.ticksize]
+cross.low.ZB <- ZB.daily[BrkNL==TRUE,(NLow-RLow)/ZB.ticksize]
+
+d<-data.table(Symbol=c('ZN','TN','ZB'),
+              "mean"=c(mean(cross.low.ZN),mean(cross.low.TN),mean(cross.low.ZB)),
+              "median"=c(median(cross.low.ZN),median(cross.low.TN),median(cross.low.ZB)),
+              "std dev"=c(sd(cross.low.ZN),sd(cross.low.TN),sd(cross.low.ZB)))
+k<-kable(d,format='html',digits=1,caption='NLow-RLow difference')
+kable_styling(k,bootstrap_options = 'striped',full_width = F,position = 'left')
+```
+
+Ok, so on average, we should expect roughly a 10 tick pop whenever an instrument breaks the highs or lows.
+
+## Let's come up with a trading plan
+
+We know that the ZN and TN are highly correlated. If one of them breaks the European highs or lows, there's roughly a 90% chance the other will follow. Let's use that knowledge to our advantage.
+
+First, let's get make a table of all the times one instrument breaks before the other. We'll use that time to enter a trade. For example, let's find out when the TN breaks session highs or lows before the ZN. We'll then enter a trade in the ZN everytime the TN breaks.
+
+We'll write function that extracts the relevant times and gives us the result in a more readable form.
+```{r}
+#the first instrument is the instrument that breaks the highs/lows first
+#the second instrument is the instrument we will trade with
+#combined.dt is the combined data table of all instruments, in our case called 'daily.combined'
+
+library(tidyr) #we will use the tidyr package to pivot our data to more readable form.
+
+
+get.trade.times <- function(first_instrument,second_instrument,combined.dt){
+  BrkNH.Time.i1 <- paste('BrkNH.Time.',first_instrument,sep='')
+  BrkNH.Time.i2 <- paste('BrkNH.Time.',second_instrument,sep='')
+  
+  BrkNL.Time.i1 <- paste('BrkNL.Time.',first_instrument,sep='')
+  BrkNL.Time.i2 <- paste('BrkNL.Time.',second_instrument,sep='')
+  
+  temp <- combined.dt[(get(BrkNH.Time.i1) <= get(BrkNH.Time.i2)) | (get(BrkNL.Time.i1) <= get(BrkNL.Time.i2))]
+  trade_times.df<- gather(temp,key=BrkFirst,value=TradeTime,BrkNH.Time.i1,BrkNL.Time.i1,na.rm=TRUE)
+  mydt<-data.table(trade_times.df)
+  mydt[,Type:=ifelse(BrkFirst==BrkNH.Time.i1,'Buy','Sell')]
+  
+  #filter out the trades that don't follow
+  mydt[Type=='Buy',Valid:=ifelse(TradeTime <= get(BrkNH.Time.i2),TRUE,FALSE)]
+  mydt[Type=='Sell',Valid:=ifelse(TradeTime <= get(BrkNL.Time.i2),TRUE,FALSE)]
+  mydt<-mydt[Valid==TRUE][,Valid:=NULL]
+  
+  #get rid of the separate BrkNH.Time and BrkNL.Time columns
+  mydt[,BrkTime:=ifelse(Type=='Sell',get(BrkNL.Time.i2),get(BrkNH.Time.i2))] 
+  mydt<-mydt[,list(Date,BrkFirst,Type,TradeTime,BrkTime)]
+  setkey(mydt,Date,TradeTime)
+  return(mydt)
+}
+ZN_trade_times_TN <- get.trade.times('TN','ZN',daily.combined)
+TN_trade_times_ZN <- get.trade.times('ZN','TN',daily.combined)
+ZN_trade_times_ZB <- get.trade.times('ZB','ZN',daily.combined)
+ZB_trade_times_ZN <- get.trade.times('ZN','ZB',daily.combined)
+ZB_trade_times_TN <- get.trade.times('ZB','TN',daily.combined)
+TN_trade_times_ZB <- get.trade.times('TN','ZB',daily.combined)
+
+k<-kable(head(ZN_trade_times_TN),format='html',digits=1)
+kable_styling(k,bootstrap_options = 'striped',position='left',full_width=F)
+```
+
+Now, let's create a function to do the trades! Our trading rules will be very simple. We buy one instrument when the other instrument breaks the European session High first. We sell when the other instrument breaks the session low first. We exit our when we hit either the stop loss or profit target. If neither the profit target or stop loss is hit, then we exit at the end of the trading day. We never hold onto a position after the end of the RTH session.
+```{r}
+
+#ticksize is the value of one tick increment. ZN.ticksize=
+#trades.dt is the data table we created from get.trade.times
+#tick.dt is our table for tick data. For ZN, it's called 'ZN'
+#SL.ticks and TP.ticks are our stop loss and profit targets.
+process.trades<-function(trades.dt,tick.dt,SL.ticks,TP.ticks, ticksize){
+  n<-nrow(trades.dt)
+  mylist<-list()
+  
+  process.trades.helper<-function(oneday.dt, tradedate, tradetime, type){
+    onerow.dt<- data.table(Date=tradedate,TradeTime=tradetime,Type=type)
+    thismoment<-oneday.dt[secs >=tradetime]
+    
+    #we refer to this time when the trades don't have an end.
+    NOTIME <- 99999L
+    
+    # we buy using market orders.
+    if(type=='Buy'){
+      onerow.dt$Entry.Price<-thismoment[1,High]
+      
+      #the distance between the NHigh and our entry price is considered our statistical edge.
+      onerow.dt$Tick.Adv <- (thismoment[1,NHigh]-onerow.dt$Entry.Price)/ticksize
+      
+      sl.price<- onerow.dt$Entry.Price - SL.ticks*ticksize
+      
+      #if the stop loss price is less than the minimum of prices
+      if(sl.price < thismoment[,min(Last)]){
+        onerow.dt$SL.Time <- NOTIME
+        onerow.dt$SL.Price.Actual <- as.double(NA)
+      } else { #we hit the stop loss
+        onerow.dt$SL.Time <- thismoment[Last <= sl.price, secs[1]]
+        onerow.dt$SL.Price.Actual <- thismoment[Last <= sl.price, Last[1]]
+      }
+      
+      #calculate the price of the profit target
+      tp.price<- onerow.dt$Entry.Price + TP.ticks*ticksize
+      
+      tp.time.tmp<-thismoment[Last >= tp.price][(Last==tp.price & BidVolume >=1) | (Last > tp.price), secs]
+      
+      #TP.Time==NOTIME if profit target is not hit.
+      onerow.dt$TP.Time<-ifelse(length(tp.time.tmp)==0,NOTIME,min(tp.time.tmp))
+      
+      if(onerow.dt$SL.Time < onerow.dt$TP.Time){
+        max.favor.ticks<-(thismoment[secs <= onerow.dt$SL.Time,max(Last)]-onerow.dt$Entry.Price)/ticksize
+        max.adverse.ticks <- (onerow.dt$Entry.Price-onerow.dt$SL.Price.Actual)/ticksize
+        onerow.dt$Max.Favor.Ticks<-max.favor.ticks
+        onerow.dt$Max.Adverse.Ticks<-max.adverse.ticks
+        onerow.dt$Result <- 'SL'
+      } else if(onerow.dt$SL.Time > onerow.dt$TP.Time){
+        max.favor.ticks <- TP.ticks
+        max.adverse.ticks <- (onerow.dt$Entry.Price-thismoment[secs <=onerow.dt$TP.Time,min(Last)])/ticksize
+        onerow.dt$Max.Favor.Ticks<-max.favor.ticks
+        onerow.dt$Max.Adverse.Ticks<-max.adverse.ticks
+        onerow.dt$Result<-'TP'
+      } else if(onerow.dt$SL.Time==onerow.dt$TP.Time & onerow.dt$SL.Time!=NOTIME){
+        max.favor.ticks <- 0
+        max.adverse.ticks <- (onerow.dt$Entry.Price-onerow.dt$SL.Price.Actual)/ticksize
+        onerow.dt$Max.Favor.Ticks<-max.favor.ticks
+        onerow.dt$Max.Adverse.Ticks<-max.adverse.ticks
+        onerow.dt$Result <- 'SL'
+      } else if(onerow.dt$SL.Time==onerow.dt$TP.Time & onerow.dt$SL.Time==NOTIME){
+        max.favor.ticks<- (max(thismoment[,Last])- onerow.dt$Entry.Price)/ticksize
+        max.adverse.ticks <- (onerow.dt$Entry.Price - min(thismoment[,Last]))/ticksize
+        onerow.dt$Max.Favor.Ticks<- max.favor.ticks
+        onerow.dt$Max.Adverse.Ticks<- max.adverse.ticks
+        onerow.dt$Result <- 'N'
+        onerow.dt$Final.Ticks <- onerow.dt$Final.Ticks <- (thismoment[.N,Last]-onerow.dt$Entry.Price)/ticksize
+
+      }
+    } else if(type=='Sell'){ #we sell on the bid price
+        onerow.dt$Entry.Price<-thismoment[1,Low]
+        
+        onerow.dt$Tick.Adv<-(onerow.dt$Entry.Price - thismoment[1,NLow])/ticksize
+        
+        sl.price<- onerow.dt$Entry.Price + SL.ticks*ticksize
+        
+      if(sl.price > thismoment[,max(Last)]){
+        onerow.dt$SL.Time <- NOTIME
+        onerow.dt$SL.Price.Actual <- as.double(NA)
+      } else {
+        onerow.dt$SL.Time <- thismoment[Last >= sl.price, secs[1]]
+        onerow.dt$SL.Price.Actual <- thismoment[Last >= sl.price, Last[1]] 
+      }
+      
+      tp.price<- onerow.dt$Entry.Price - TP.ticks*ticksize
+      tp.time.tmp <-thismoment[Last <= tp.price][(Last==tp.price & AskVolume >=1) | (Last < tp.price), secs]
+      
+      onerow.dt$TP.Time<-ifelse(length(tp.time.tmp)==0,NOTIME,min(tp.time.tmp))
+      
+      if(onerow.dt$SL.Time < onerow.dt$TP.Time) {
+        max.favor.ticks <- to.ticks(onerow.dt$Entry.Price - thismoment[secs <= onerow.dt$SL.Time, min(Last)],ticksize)
+        max.adverse.ticks <- to.ticks(onerow.dt$SL.Price.Actual-onerow.dt$Entry.Price,ticksize)
+        
+        
+        onerow.dt$Max.Favor.Ticks<-max.favor.ticks
+        onerow.dt$Max.Adverse.Ticks<-max.adverse.ticks
+        onerow.dt$Result <- 'SL'
+      }
+      else if(onerow.dt$SL.Time > onerow.dt$TP.Time){
+        max.favor.ticks <- TP.ticks
+        max.adverse.ticks<- to.ticks(thismoment[secs <= onerow.dt$TP.Time, max(Last)] - onerow.dt$Entry.Price, ticksize)
+        
+        
+        onerow.dt$Max.Favor.Ticks<-max.favor.ticks
+        onerow.dt$Max.Adverse.Ticks<-max.adverse.ticks
+        onerow.dt$Result <- 'TP'
+      }
+      else if(onerow.dt$SL.Time==onerow.dt$TP.Time & onerow.dt$SL.Time!=NOTIME){
+        max.favor.ticks <- 0
+        max.adverse.ticks <- to.ticks(onerow.dt$SL.Price.Actual-onerow.dt$Entry.Price,ticksize)
+        onerow.dt$Max.Favor.Ticks<-max.favor.ticks
+        onerow.dt$Max.Adverse.Ticks<-max.adverse.ticks
+        onerow.dt$Result <- 'SL'
+      }
+      else if(onerow.dt$SL.Time==onerow.dt$TP.Time & onerow.dt$SL.Time==NOTIME){
+        max.favor.ticks<- to.ticks(onerow.dt$Entry.Price-min(thismoment[,Last]),ticksize)
+        max.adverse.ticks <- to.ticks(max(thismoment[,Last]) - onerow.dt$Entry.Price,ticksize)
+        onerow.dt$Max.Favor.Ticks<-max.favor.ticks
+        onerow.dt$Max.Adverse.Ticks<-max.adverse.ticks
+        onerow.dt$Result <- 'N'
+        onerow.dt$Final.Ticks <- to.ticks(onerow.dt$Entry.Price-thismoment[.N,Last],ticksize) 
+      }
+    }
+    onerow.dt
+  }
+  
+  for(x in 1:n){
+    this.date<-trades.dt[x, Date]
+    this.time<-trades.dt[x, TradeTime]
+    this.type<-trades.dt[x, Type]
+    
+    thisday.dt<-tick.dt[Date==this.date]
+    mylist[[x]]<-process.trades.helper(thisday.dt,this.date, this.time,this.type)
+  }
+  mydt<-rbindlist(mylist,use.names = TRUE, fill=TRUE)
+  mydt[Result=='TP',PL:=Max.Favor.Ticks]
+  mydt[Result=='SL',PL:=-Max.Adverse.Ticks]
+  mydt[Result=='N',PL:=Final.Ticks]
+  mydt
+  
+}
+```
+
+
+```{r}
+#calculates the maximum drawdown from the PL column from the data.table return by process.trades
+#trade_results is a vector of the column from PL column
+maxdrawdown <- function(trade_results){
+  curr_profit <- cumsum(trade_results)
+  max_profit <- cummax(curr_profit)
+  drawdown <- max_profit-curr_profit
+  return(-1*max(drawdown))
+}
+
+#gives a summary of the results from the data.table returned by process.trades
+summarize.results <- function(trade.results, types=c('All','Buy','Sell')){
+  results <- data.table()
+  for(type in types) {
+    if(type!='All')  {
+      mydt.results<-copy(trade.results[Type==type])
+    } else {
+      mydt.results<-copy(trade.results)
+    }
+    mydt<-data.table(Type=type)
+    mydt[,gross.profit:=mydt.results[PL >= 0,sum(PL)]]
+    mydt$gross.loss <- mydt.results[PL <  0,sum(PL)]        
+    mydt[,net.profit:=gross.profit + gross.loss]
+
+    mydt$num.trades<-nrow(mydt.results)
+    mydt$num.profit.trades<-nrow(mydt.results[PL>=0])
+    mydt$num.losing.trades <- nrow(mydt.results[PL < 0])
+    mydt[,winning.percentage:=num.profit.trades/(num.trades)]
+    
+    mydt[,profit.factor:=gross.profit/(-1*gross.loss)]
+    mydt$maxdd<-maxdrawdown(mydt.results$PL)
+    mydt[,Profit.to.DD.ratio :=net.profit/(-1*maxdd)]
+    mydt[,Mean.Tick.Adv:=mean(mydt.results$Tick.Adv)]
+    results<-rbind(results,mydt)
+  }
+  return(results)
+}
+```
+
+We'll use 10 tick profit target because that's roughly equal to the difference between RHigh and NHigh, and NLow and RLow. We choose a 5 tick stop loss because the range for the European session is roughly 10 ticks and we chooose half the range as the stop loss. We want to have a 1:2 risk/reward ratio. 
+```{r}
+ZN.trades.TN<-process.trades(ZN_trade_times_TN,ZN,SL.ticks = 5, TP.ticks=10,ZN.ticksize)
+TN.trades.ZN<-process.trades(TN_trade_times_ZN,TN,SL.ticks = 5, TP.ticks=10,ZN.ticksize)
+ZN.trades.ZB<-process.trades(ZN_trade_times_ZB,ZN,SL.ticks = 5, TP.ticks=10,ZN.ticksize)
+ZB.trades.ZN<-process.trades(ZB_trade_times_ZN,ZB,SL.ticks = 5, TP.ticks=10,ZB.ticksize)
+ZB.trades.TN<-process.trades(ZB_trade_times_TN,ZB,SL.ticks = 5, TP.ticks=10,ZB.ticksize)
+TN.trades.ZB<-process.trades(TN_trade_times_ZB,TN,SL.ticks = 5, TP.ticks=10,ZN.ticksize)
+```
+
+Let's summarize the results!
+```{r}
+#we make a function to summarize the results and pivot the columns to rows to make it easier to read
+summarize.pivot.table<-function(trade.results){
+  mydt<-dcast(melt(summarize.results(trade.results),id.vars='Type'), variable ~ Type)
+  mydt$variable <- c('Gross Profit','Gross Loss','Net Profit','Number of Trades','Number of Profitable Trades','Number of Losing Trades','Winning Percentage','Profit Factor','Max Drawdown','Profit to max drawdown ratio','Mean Tick Advantage')
+  return(mydt)
+}
+
+ZN.trades.TN.summary <- summarize.pivot.table(ZN.trades.TN)
+ZN.trades.ZB.summary <- summarize.pivot.table(ZN.trades.ZB)
+TN.trades.ZN.summary <- summarize.pivot.table(TN.trades.ZN)
+TN.trades.ZB.summary <- summarize.pivot.table(TN.trades.ZB)
+ZB.trades.ZN.summary <- summarize.pivot.table(ZB.trades.ZN)
+ZB.trades.TN.summary <- summarize.pivot.table(ZB.trades.TN)
+
+k<-kable(ZN.trades.TN.summary,format='html',caption='ZN following TN',digits = 1)
+kable_styling(k,bootstrap_options = 'striped',full_width = F,position='left')
+
+k<- kable(ZN.trades.ZB.summary,format='html',caption='ZN following ZB',digits = 1)
+kable_styling(k,bootstrap_options = 'striped',full_width = F,position='left')
+
+k<-kable(TN.trades.ZN.summary,format='html',caption='TN following ZN',digits = 1)
+kable_styling(k,bootstrap_options = 'striped',full_width = F,position='left')
+
+k<-kable(TN.trades.ZB.summary,format='html',caption='TN following ZB',digits = 1)
+kable_styling(k,bootstrap_options = 'striped',full_width = F,position='left')
+
+k<-kable(ZB.trades.ZN.summary,format='html',caption='ZB following ZN',digits = 1)
+kable_styling(k,bootstrap_options = 'striped',full_width = F,position='left')
+
+k<-kable(ZB.trades.TN.summary,format='html',caption='ZB following TN',digits = 1)
+kable_styling(k,bootstrap_options = 'striped',full_width=F,position = 'left')
+```
+Great! We have some encouraging results. Our strategy is profitable across 3 different instruments across all the various combination of correlations. Some correlations seem to work better than others however. The 'ZB following ZN' had the highest profit factor (1.6), followed by the 'TN following ZN' (1.5), 'TN following ZB' (1.5), 'ZN following ZB' (1.4).  The lowest profit factor was the 'ZN following TN' strategy(PF=1.1). In general, we see that if the ZN leads, the strategies tend to work better than if the ZN follows. This makes sense as the ZN is the most heavily traded contract. When the ZN moves, it can be considered more significant because more volume is being exchanged. The other contracts have much lower traded volume so the moves might not be considered as significant.
+
+If we break it down further to long vs short strategy, we see that the long side is much more profitable than the short side. In some cases, the short side produced negative returns, like the 'ZN following TN' and 'ZB following ZN' strategy. The most profitable short selling strategy, 'TN following ZN', only had a 1.4 profit factor, much smaller than the top long trading strategy, 'ZB following ZN' (PF=2.0).
+
+Let's run some statistical analysis on the profit factor between the buy side and sell side.
+
+```{r}
+#this function calculates the profit factor from a vector of trades
+pf.func<-function(PL){
+  profit<-sum(PL[PL >=0])
+  loss <- sum(PL[PL < 0])
+  return(profit/(-1*loss))
+}
+
+mean.pf.both.side <- boot.mean.ci(ZB.trades.ZN[,PL],pf.func)
+mean.pf.buy.side <- boot.mean.ci(ZB.trades.ZN[Type=='Buy',PL],pf.func)
+mean.pf.sell.side <- boot.mean.ci(ZB.trades.ZN[Type=='Sell',PL],pf.func)
+
+d<-data.table(Type=c('Both sides','Buy side','Sell Side'), 
+              mean=c(mean.pf.both.side[1],mean.pf.buy.side[1],mean.pf.sell.side[1]),
+              lower_ci=c(mean.pf.both.side[2],mean.pf.buy.side[2],mean.pf.sell.side[2]),
+              upper_ci=c(mean.pf.both.side[3],mean.pf.buy.side[3],mean.pf.sell.side[3]))
+
+ggplot(d, aes(x=Type, y=mean, ymin=lower_ci,ymax=upper_ci))+geom_point()+geom_errorbar(width=0.2) + ggtitle('ZB Following ZN Profit Factor Breakdown') + xlab('Types') + ylab('Profit Factor')
+
+```
+
+```{r}
+#let's calculate p-values for the difference between the buy side and sell side profit factor
+pval <- p.value(ZB.trades.ZN[Type=='Buy',PL],ZB.trades.ZN[Type=='Sell',PL], pf.func)
+print(pval)
+```
+The p-value for the difference of the profit factors between the buy side and sell side is 0.09. While this may not satisfy the scientific standard of 0.05, it is good enough for us to draw a conclusion that there is a difference between the buy and sell side profit factors. Since there is a difference between the two profit factors, we will only trade the Buy side because it's a lot more profitable.
+
+Also, it's interesting to note that the 'ZB following ZN' had the highest tick advantage of all the strategies. This means that when we enter a trade, the tick distance from our entry price and the European session highs or lows is the farthest away. It's also our most profitable trading strategy.
+
+
+## Monte Carlo Simulation
+
+Now, let's run a Monte Carlo simulation to find out how robust our trading system is. In a Monte Carlo simulation we randomly mix the order of the trades. We do this again and again, many times over. This is similar to our permutations method for calculating p-values. What we want to know is how large of a drawdown we can expect. This is very important because we want to know the point where our system is no longer working. For instance, let's say we chose the bottom 5% of the max drawdown distribution as our cutoff point--if our trading system experiences a drawdown in the bottom -2.5%, we know that the system is no longer valid. The drawdown is out of the norm. The market has changed and our system no longer works. 
+
+So, let's make a Monte Carlo simulation function.
+```{r}
+#trade_results is the data.table from process.trades
+#returns a data.table of all the permutations in summary form from summarize.results()
+monte.carlo<-function(trade_results,n=10000, types=c('All','Buy','Sell')){
+  mydt<-NULL
+  indices <- 1:nrow(trade_results)
+  for(i in 1:n){
+    scrambled.indices <- sample(indices,length(indices))
+    mydt<-rbind(mydt,summarize.results(trade_results[scrambled.indices],types),use.names=TRUE,fill=TRUE)
+  }
+  mydt
+}
+```
+
+We'll run the Monte Carlo simulation only on the Long side 'ZB following ZN' strategy since it's our best strategy.
+
+```{r}
+ZB.following.ZN.monte.carlo<-monte.carlo(ZB.trades.ZN[Type=='Buy'],types='Buy')
+probs <-c(0.025,0.05,0.5,0.95,0.975)
+quantile(ZB.following.ZN.monte.carlo[,maxdd],probs)
+```
+
+We see that the bottom -2.5% percentile max drawdown is -55 ticks with an average of -32 ticks. What this means is that if our system suffers a -55 ticks drawdown, we can consider it to be no longer valid for the current market conditions.
+
+## Conclusion
+
+The market exhibits very strong correlation for certain instruments, especially the Treasury market. The ZN, TN, and ZB all exhibit very positive correlations. We see from our trading plan that we can take advantage of this relationship in a leader-follower type of strategy. If one instrument breaks the highs or lows of the European session, it's very likely that another instrument will follow if they are highly correlated. We can then trade the follower instrument which gives us a statistical edge in that we know the direction of the market ahead of time.
+
+Our simple trading system is fairly robust. It is profitable on all 3 instruments across all relationships. The long side exhibited greater profitability while the short side was much more volatile in profitability. Our profit to max drawdown was very good at 15:1. Our trading rules were simple so it should be very dynamic across many different market conditions. Systems that have complicated rules tend to suffer more from curve fitting. These complicated systems tend to fail much faster in real life trading than simple ones.   
+
+In addtion, we didn't do any parameter optimization on our system. Further research on optimization parameters might yield even higher profitability. However, over-optimization might result in curve fitting that results in poor performance when we do out of sample testing.  
+
+The main weakness of our system is that it doesn't yield a high number of trades(we only had 123 trades over 2 years), thus any real life walk forward testing will be difficult to perform due to a lack of data points. Also, a low number of trades will require high leverage to yield decent returns, which of course, puts more of our capital at greater risk if the system fails.
+
+All in all, we prove here that using correlations to trade can result in a profitable trading strategy.
