@@ -706,7 +706,7 @@ b&lt;-boot.mean.ci(ZN.daily[,BrkNH|BrkNL],prob)
 print(b)</code></pre>
 <pre><code>##      mean      2.5%     97.5% 
 ## 0.9674379 0.9513185 0.9817444</code></pre>
-<p>Looks like there’s almost a 96% probability that the ZN price in the RTH session breaks the European session high or low. The 95% confidence interval is (94.8%, 97.0%) That’s important to know. How about the TN or ZB? Do they behave in a similar manner?</p>
+<p>Looks like there’s a 96.7% probability that the ZN price in the RTH session breaks the European session high or low. The 95% confidence interval is (95.1%, 98.2%) That’s important to know. How about the TN or ZB? Do they behave in a similar manner?</p>
 <pre class="r"><code>b&lt;-boot.mean.ci(data=ZB.daily[,BrkNH|BrkNL],func=prob)
 print(b)</code></pre>
 <pre><code>##      mean      2.5%     97.5% 
