@@ -2718,7 +2718,7 @@ ggplot(d, aes(x=Type, y=mean, ymin=lower_ci,ymax=upper_ci))+geom_point()+geom_er
 pval &lt;- p.value(ZB.trades.ZN[Type=='Buy',PL],ZB.trades.ZN[Type=='Sell',PL], pf.func)
 print(pval)</code></pre>
 <pre><code>## [1] 0.0899</code></pre>
-<p>The p-value for the difference of the profit factors between the buy side and sell side is 0.09. While this may not satisfy the scientific standard of 0.05, it is good enough for us to draw a conclusion that there is a difference between the buy and sell side profit factors. Since there is a difference between the two profit factors, we will only trade the Buy side because it’s a lot more profitable.</p>
+<p>The p-value for the difference of the profit factors between the buy side and sell side is 0.089. While this may not satisfy the scientific standard of 0.05, it is good enough for us to draw a conclusion that there is a difference between the buy and sell side profit factors. Since there is a difference between the two profit factors, we will only trade the Buy side because it’s a lot more profitable.</p>
 <p>Also, it’s interesting to note that the ‘ZB following ZN’ had the highest tick advantage of all the strategies. This means that when we enter a trade, the tick distance from our entry price and the European session highs or lows is the farthest away. It’s also our most profitable trading strategy.</p>
 </div>
 <div id="monte-carlo-simulation" class="section level2">
@@ -2742,7 +2742,7 @@ probs &lt;-c(0.025,0.05,0.5,0.95,0.975)
 quantile(ZB.following.ZN.monte.carlo[,maxdd],probs)</code></pre>
 <pre><code>##  2.5%    5%   50%   95% 97.5% 
 ##   -55   -50   -31   -20   -20</code></pre>
-<p>We see that the bottom -2.5% percentile max drawdown is -55 ticks with an average of -32 ticks. What this means is that if our system suffers a -55 ticks drawdown, we can consider it to be no longer valid for the current market conditions.</p>
+<p>We see that the bottom -2.5% percentile max drawdown is -55 ticks with an average of -31 ticks. What this means is that if our system suffers a -55 ticks drawdown, we can consider it to be no longer valid for the current market conditions.</p>
 </div>
 <div id="conclusion" class="section level2">
 <h2>Conclusion</h2>
