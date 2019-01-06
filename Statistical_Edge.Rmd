@@ -314,7 +314,7 @@ kable_styling(k,bootstrap_options = c("striped"), full_width = FALSE,position='l
 These dates correspond to Labor Day and Thanksgiving Holiday. No way we trade during these days. The <code>TotalVolume</code> during those days is also very low considering that the average volume per day is roughly 1M contracts. It's best we avoid these days. 
 
 ```{r}
-holidays<-lasttick.dt[lasttick < 42300]$Date
+holidays<-unique(lasttick.dt[lasttick < 42300]$Date)
 # let's trim the holidays from out data table
 ZNZ17.dt<-ZNZ17.dt[!(Date %in% holidays)]
 print(unique(ZNZ17.dt$Date))
@@ -325,16 +325,17 @@ Let's make a function that extracts the holidays from a data table and run that 
 ```{r }
 # returns a vector of dates of holidays. takes as argument a filename corresponding to the contract txt file.
 # we define a holiday as any day where the last trade happens before 11:45 am
-get.holidays<-function(filename){
-  tickdata.dt <- loadtxtfile(filename)
+get.holidays<-function(contract){
+  filename <- paste('txt/',contract,'.txt',sep='')
+  dates<- readRDS(paste('dates/',contract,'.rds',sep=''))
+  tickdata.dt <- loadtxtfile(filename)[Date %in% dates]
   mydt<-tickdata.dt[,list(lasttick=max(secs)),by=Date]
   return(mydt[lasttick < 42300]$Date)
 }
 
 holiday.dates<-NULL
 for(x in c(ZN.contracts,'ZNH19')){
-  filename<-paste('txt/',x,'.txt',sep='')
-  holiday.dates<-c(holiday.dates,get.holidays(filename))
+  holiday.dates<-c(holiday.dates,get.holidays(x))
 }
 saveRDS(holiday.dates,file=paste('dates/holidays.rds'))
 ```
@@ -496,7 +497,7 @@ set.seed(123)
 b<-boot.mean.ci(ZN.daily[,BrkNH|BrkNL],prob)
 print(b)
 ```
-Looks like there's almost a 96%  probability that the ZN price in the RTH session breaks the European session high or low. The 95% confidence interval is (94.8%, 97.0%) That's important to know. How about the TN or ZB? Do they behave in a similar manner?
+Looks like there's 96.7%  probability that the ZN price in the RTH session breaks the European session high or low. The 95% confidence interval is (95.3%, 98.2%) That's important to know. How about the TN or ZB? Do they behave in a similar manner?
 
 ```{r}
 b<-boot.mean.ci(data=ZB.daily[,BrkNH|BrkNL],func=prob)
@@ -562,7 +563,7 @@ k<-kable(d,format='html')
 kable_styling(k,bootstrap_options = 'striped',full_width = F,position='left')
 ```
 
-Here, the p-values for the ZB is quite high. It doesn't seem to favor breaking the session highs or lows. However, the ZN and TN does seem to favor the highs even the p-value is greater than 0.05.
+Here, the p-values for all three instruments is quite high. They don't seem to favor breaking the session highs or lows. 
 
 What about the RTH session breaking both the European highs and lows on the same day?
 ```{r}
@@ -601,13 +602,13 @@ What if the ZB breaks the European high, what are the odds the ZN does the same?
 daily.combined[BrkNH.ZB==TRUE,prob(BrkNH.ZN)]
 ```
 
-89.5%. That's a pretty good correlation. There's a small error in our logic though. We are not taking into account time of day. We are just counting if they break on the same day. For instance, if ZN breaks first before the ZB, our test wouldn't know that. We can't tell the future so we shouldn't include that in the case. We should only include cases where the ZB breaks first since we want to see if ZN follows. Let's redo the test.
+89.3%. That's a pretty good correlation. There's a small error in our logic though. We are not taking into account time of day. We are just counting if they break on the same day. For instance, if ZN breaks first before the ZB, our test wouldn't know that. We can't tell the future so we shouldn't include that in the case. We should only include cases where the ZB breaks first since we want to see if ZN follows. Let's redo the test.
 
 ```{r}
 daily.combined[BrkNH.ZB==TRUE & (BrkNH.ZN==FALSE | (BrkNH.Time.ZB < BrkNH.Time.ZN)),prob(BrkNH.ZN)]
 ```
 
-Much better. Here we only included cases where either the ZN didn't break the high or it broke after the ZB. 82.4% is still very high, though not as good as 89.5%.
+Much better. Here we only included cases where either the ZN didn't break the high or it broke after the ZB. 81.5% is still very high, though not as good as 89.5%.
 
 Let's check the confidence intervals.
 ```{r}
@@ -616,7 +617,7 @@ print(b)
 
 ```
 
-The average is around 82.4%. At the very least, we should expect a 76.9% probability that the ZN will follow the ZB in breaking the highs. A pretty good correlation.
+The average is around 81.5%. At the very least, we should expect a 76.2% probability that the ZN will follow the ZB in breaking the highs. A pretty good correlation.
 
 What if we reverse the order, meaning we want to find out what happens when ZN breaks first, does the ZB follow?
 ```{r}
@@ -625,7 +626,7 @@ b<- boot.mean.ci(data,prob)
 print(b)
 
 ```
-80.7%. At the very least, we should expect a 74.1% chance that ZB follows the ZN. Much lower than if ZB is the leader. Does this mean that ZB is more of a leader for the ZN? Let's check p values to make sure if our relationship is statistically significant.
+83.9%. At the very least, we should expect a 78.8% chance that ZB follows the ZN. Much lower than if ZB is the leader. Does this mean that ZB is more of a leader for the ZN? Let's check p values to make sure if our relationship is statistically significant.
 
 ```{r}
 ZB.breaks.first <- daily.combined[BrkNH.ZB==TRUE & (BrkNH.ZN==FALSE | BrkNH.Time.ZB < BrkNH.Time.ZN), BrkNH.ZN]
@@ -990,9 +991,9 @@ kable_styling(k,bootstrap_options = 'striped',full_width = F,position='left')
 k<-kable(ZB.trades.TN.summary,format='html',caption='ZB following TN',digits = 1)
 kable_styling(k,bootstrap_options = 'striped',full_width=F,position = 'left')
 ```
-Great! We have some encouraging results. Our strategy is profitable across 3 different instruments across all the various combination of correlations. Some correlations seem to work better than others however. The 'ZB following ZN' had the highest profit factor (1.6), followed by the 'TN following ZN' (1.5), 'TN following ZB' (1.5), 'ZN following ZB' (1.4).  The lowest profit factor was the 'ZN following TN' strategy(PF=1.1). In general, we see that if the ZN leads, the strategies tend to work better than if the ZN follows. This makes sense as the ZN is the most heavily traded contract. When the ZN moves, it can be considered more significant because more volume is being exchanged. The other contracts have much lower traded volume so the moves might not be considered as significant.
+Great! We have some encouraging results. Our strategy is profitable across 3 different instruments across all the various combination of correlations. Some correlations seem to work better than others however. The 'ZB following ZN' had the highest profit factor (1.6), followed by the 'TN following ZB' (1.5), 'TN following ZN' (1.4), 'ZN following ZB' (1.4).  The lowest profit factor was the 'ZN following TN' strategy(PF=1.1). In general, we see that if the ZN leads, the strategies tend to work better than if the ZN follows. This makes sense as the ZN is the most heavily traded contract. When the ZN moves, it can be considered more significant because more volume is being exchanged. The other contracts have much lower traded volume so the moves might not be considered as significant.
 
-If we break it down further to long vs short strategy, we see that the long side is much more profitable than the short side. In some cases, the short side produced negative returns, like the 'ZN following TN' and 'ZB following ZN' strategy. The most profitable short selling strategy, 'TN following ZN', only had a 1.4 profit factor, much smaller than the top long trading strategy, 'ZB following ZN' (PF=2.0).
+If we break it down further to long vs short strategy, we see that the long side is much more profitable than the short side. In some cases, the short side produced negative returns, like the 'ZN following TN'strategy. The most profitable short selling strategy, 'TN following ZB', only had a 1.5 profit factor, much smaller than the top long trading strategy, 'ZB following ZN' (PF=1.9).
 
 Let's run some statistical analysis on the profit factor between the buy side and sell side.
 
@@ -1022,7 +1023,7 @@ ggplot(d, aes(x=Type, y=mean, ymin=lower_ci,ymax=upper_ci))+geom_point()+geom_er
 pval <- p.value(ZB.trades.ZN[Type=='Buy',PL],ZB.trades.ZN[Type=='Sell',PL], pf.func)
 print(pval)
 ```
-The p-value for the difference of the profit factors between the buy side and sell side is 0.09. While this may not satisfy the scientific standard of 0.05, it is good enough for us to draw a conclusion that there is a difference between the buy and sell side profit factors. Since there is a difference between the two profit factors, we will only trade the Buy side because it's a lot more profitable.
+The p-value for the difference of the profit factors between the buy side and sell side is 0.178. While this may not satisfy the scientific standard of 0.05, we may make a weak conclusion that there is a difference between the buy and sell side profit factors. For our trading, we will only do the buy side as it seems to be more profitable across various different instruments.
 
 Also, it's interesting to note that the 'ZB following ZN' had the highest tick advantage of all the strategies. This means that when we enter a trade, the tick distance from our entry price and the European session highs or lows is the farthest away. It's also our most profitable trading strategy.
 
@@ -1054,7 +1055,7 @@ probs <-c(0.025,0.05,0.5,0.95,0.975)
 quantile(ZB.following.ZN.monte.carlo[,maxdd],probs)
 ```
 
-We see that the bottom -2.5% percentile max drawdown is -55 ticks with an average of -32 ticks. What this means is that if our system suffers a -55 ticks drawdown, we can consider it to be no longer valid for the current market conditions.
+We see that the bottom -2.5% percentile max drawdown is -65 ticks with an average of -38 ticks. What this means is that if our system suffers a -65 ticks drawdown, we can consider it to be no longer valid for the current market conditions.
 
 ## Conclusion
 
@@ -1064,6 +1065,6 @@ Our simple trading system is fairly robust. It is profitable on all 3 instrument
 
 In addtion, we didn't do any parameter optimization on our system. Further research on optimization parameters might yield even higher profitability. However, over-optimization might result in curve fitting that results in poor performance when we do out of sample testing.  
 
-The main weakness of our system is that it doesn't yield a high number of trades(we only had 123 trades over 2 years), thus any real life walk forward testing will be difficult to perform due to a lack of data points. Also, a low number of trades will require high leverage to yield decent returns, which of course, puts more of our capital at greater risk if the system fails.
+The main weakness of our system is that it doesn't yield a high number of trades(we only had 167 trades over 2 years), thus any real life walk forward testing will be difficult to perform due to a lack of data points. Also, a low number of trades will require high leverage to yield decent returns, which of course, puts more of our capital at greater risk if the system fails.
 
 All in all, we prove here that using correlations to trade can result in a profitable trading strategy.
